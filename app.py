@@ -5,6 +5,7 @@ Local Amazon.in / Flipkart price checker (Streamlit + sync Playwright).
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any
 from urllib.parse import quote_plus, urljoin, urlparse
@@ -47,6 +48,14 @@ CAPTCHA_HINTS = (
     "access denied",
     "captcha",
     "validatecaptcha",
+    "automated access",
+    "api-services-support@amazon.com",
+    "we just need to make sure",
+    "something went wrong",
+    "request could not be satisfied",
+    "shield",
+    "cf-chl",
+    "challenge",
 )
 
 
@@ -410,9 +419,10 @@ def amazon_first_organic_url(page: Page, keyword: str, timeout_ms: int) -> str:
 
     cards = page.locator('div[data-component-type="s-search-result"][data-asin]')
     try:
-        cards.first.wait_for(state="attached", timeout=timeout_ms)
+        cards.first.wait_for(state="attached", timeout=min(timeout_ms, 12000))
     except PlaywrightTimeoutError as exc:
-        raise CaptchaOrBlockError("Amazon.in: search results did not load") from exc
+        _raise_if_blocked(page, "Amazon.in")
+        raise CaptchaOrBlockError("Amazon.in: search results did not load (page delayed or bot-blocked)") from exc
 
     count = cards.count()
     for i in range(count):
@@ -454,9 +464,10 @@ def flipkart_first_organic_url(page: Page, keyword: str, timeout_ms: int) -> str
 
     links = page.locator('a[href*="/p/"]')
     try:
-        links.first.wait_for(state="attached", timeout=timeout_ms)
+        links.first.wait_for(state="attached", timeout=min(timeout_ms, 12000))
     except PlaywrightTimeoutError as exc:
-        raise CaptchaOrBlockError("Flipkart: search results did not load") from exc
+        _raise_if_blocked(page, "Flipkart")
+        raise CaptchaOrBlockError("Flipkart: search results did not load (page delayed or bot-blocked)") from exc
 
     count = min(links.count(), 40)
     for i in range(count):
@@ -661,8 +672,8 @@ def empty_result(site_label: str, error: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 @retry(
     reraise=True,
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=1, min=2, max=30),
+    stop=stop_after_attempt(2),
+    wait=wait_exponential(multiplier=1, min=1, max=3),
     retry=retry_if_exception_type(
         (CaptchaOrBlockError, ScrapeError, PlaywrightTimeoutError)
     ),
@@ -676,10 +687,17 @@ def scrape_site(page: Page, site: str, keyword: str, timeout_ms: int) -> dict[st
     return scrape_product_page(page, product_url, "flipkart", timeout_ms)
 
 
-def scrape_both(keyword: str, headless: bool, timeout_ms: int) -> dict[str, dict[str, Any]]:
+def scrape_both(
+    keyword: str, headless: bool, timeout_ms: int, log_fn: Any = None
+) -> dict[str, dict[str, Any]]:
     """Search both sites using one persistent tab; each site has its own retries."""
+    def log(msg: str) -> None:
+        if log_fn:
+            log_fn(msg)
+
     results: dict[str, dict[str, Any]] = {}
     with sync_playwright() as p:
+        log("🚀 Initializing Chromium browser...")
         try:
             context = p.chromium.launch_persistent_context(
                 user_data_dir=BROWSER_SESSION_DIR,
@@ -717,15 +735,21 @@ def scrape_both(keyword: str, headless: bool, timeout_ms: int) -> dict[str, dict
 
             stealth_sync(page)
 
+            log(f"🛒 Searching Amazon.in for '{keyword}'...")
             try:
                 results["amazon"] = scrape_site(page, "amazon", keyword, timeout_ms)
+                log("✅ Amazon.in: search and extract complete")
             except Exception as exc:
                 results["amazon"] = empty_result("Amazon.in", str(exc))
+                log(f"⚠️ Amazon.in: {exc}")
 
+            log(f"🛍️ Searching Flipkart for '{keyword}'...")
             try:
                 results["flipkart"] = scrape_site(page, "flipkart", keyword, timeout_ms)
+                log("✅ Flipkart: search and extract complete")
             except Exception as exc:
                 results["flipkart"] = empty_result("Flipkart", str(exc))
+                log(f"⚠️ Flipkart: {exc}")
 
             return results
         finally:
@@ -776,12 +800,21 @@ def main() -> None:
         "and reads price + delivery from the first organic product page."
     )
 
+    is_cloud = bool(os.environ.get("RENDER") or os.environ.get("PORT"))
+
     with st.sidebar:
         st.header("Settings")
-        headed = st.checkbox("Headed (warm-up)", value=False)
-        timeout_s = st.slider("Page timeout (seconds)", 15, 90, 45)
-        st.markdown(
-            """
+        if is_cloud:
+            st.info("☁️ **Cloud Deployment**: Running headless in Render container.")
+            headed = False
+        else:
+            headed = st.checkbox("Headed (warm-up)", value=False)
+
+        timeout_s = st.slider("Page timeout (seconds)", 10, 60, 25)
+
+        if not is_cloud:
+            st.markdown(
+                """
 **One-time warm-up**
 
 1. Enable **Headed (warm-up)** above
@@ -789,8 +822,13 @@ def main() -> None:
 3. In the browser window, set your **Kolkata pincode** on Amazon.in and Flipkart
 4. Solve captchas / login once if asked
 5. Close the app — cookies stay in `./browser_session`
-            """
-        )
+                """
+            )
+        else:
+            st.caption(
+                "💡 Note: Cloud datacenter IPs may occasionally be blocked or delayed by Amazon/Flipkart. "
+                "For guaranteed residential IP bypass, run locally with Cloudflare Tunnel."
+            )
 
     keyword = st.text_input(
         "Product name or keyword",
@@ -799,17 +837,25 @@ def main() -> None:
     run = st.button("Compare prices", type="primary", disabled=not bool(keyword.strip()))
 
     if run and keyword.strip():
-        headless = not headed
+        headless = True if is_cloud else (not headed)
         timeout_ms = int(timeout_s) * 1000
-        with st.spinner("Searching Amazon.in and Flipkart (retries on blocks)…"):
+
+        with st.status("🔍 Searching Amazon.in and Flipkart...", expanded=True) as status_box:
             try:
-                results = scrape_both(keyword.strip(), headless=headless, timeout_ms=timeout_ms)
-            except Exception as exc:
-                st.error(f"Scrape failed after retries: {exc}")
-                st.info(
-                    "Try enabling **Headed (warm-up)** in the sidebar, solve any captcha, "
-                    "set your pincode, then search again."
+                results = scrape_both(
+                    keyword.strip(),
+                    headless=headless,
+                    timeout_ms=timeout_ms,
+                    log_fn=status_box.write,
                 )
+                status_box.update(
+                    label="✅ Search finished", state="complete", expanded=False
+                )
+            except Exception as exc:
+                status_box.update(
+                    label="⚠️ Search encountered an error", state="error", expanded=True
+                )
+                st.error(f"Scrape failed: {exc}")
                 return
 
         c1, c2 = st.columns(2)
