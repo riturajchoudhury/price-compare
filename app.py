@@ -680,18 +680,35 @@ def scrape_both(keyword: str, headless: bool, timeout_ms: int) -> dict[str, dict
     """Search both sites using one persistent tab; each site has its own retries."""
     results: dict[str, dict[str, Any]] = {}
     with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(
-            user_data_dir=BROWSER_SESSION_DIR,
-            headless=headless,
-            locale="en-IN",
-            timezone_id="Asia/Kolkata",
-            viewport={"width": 1366, "height": 900},
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
+        try:
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=BROWSER_SESSION_DIR,
+                headless=headless,
+                locale="en-IN",
+                timezone_id="Asia/Kolkata",
+                viewport={"width": 1366, "height": 900},
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+        except Exception as launch_exc:
+            if "Missing X server" in str(launch_exc) or "XServer" in str(launch_exc):
+                context = p.chromium.launch_persistent_context(
+                    user_data_dir=BROWSER_SESSION_DIR,
+                    headless=True,
+                    locale="en-IN",
+                    timezone_id="Asia/Kolkata",
+                    viewport={"width": 1366, "height": 900},
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                    ],
+                )
+            else:
+                raise launch_exc
         try:
             if context.pages:
                 page = context.pages[0]
