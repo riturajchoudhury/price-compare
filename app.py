@@ -737,6 +737,15 @@ def scrape_both(
 
             stealth_sync(page)
 
+            # Block heavy resources to reduce RAM, bandwidth, and load times
+            def route_interceptor(route: Any) -> None:
+                if route.request.resource_type in {"image", "media", "font"}:
+                    route.abort()
+                else:
+                    route.continue_()
+            
+            context.route("**/*", route_interceptor)
+
             log(f"🛒 Searching Amazon.in for '{keyword}'...")
             try:
                 results["amazon"] = scrape_site(page, "amazon", keyword, timeout_ms)
