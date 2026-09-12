@@ -1,0 +1,9 @@
+browser_session/
+.venv/
+__pycache__/
+*.pyc
+.Python
+.env
+_probe_*
+_fk_*
+app_backup.txt

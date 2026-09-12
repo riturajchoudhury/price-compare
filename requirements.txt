@@ -1,0 +1,4 @@
+streamlit
+playwright
+playwright-stealth
+tenacity
