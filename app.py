@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from typing import Any
 from urllib.parse import quote_plus, urljoin, urlparse
 
@@ -695,6 +696,10 @@ def scrape_both(
         if log_fn:
             log_fn(msg)
 
+    # Linux and Cloud servers do not have an active monitor; always force headless
+    if sys.platform != "win32" or os.environ.get("RENDER") or os.environ.get("PORT") or not os.environ.get("DISPLAY"):
+        headless = True
+
     results: dict[str, dict[str, Any]] = {}
     with sync_playwright() as p:
         log("🚀 Initializing Chromium browser...")
@@ -711,22 +716,19 @@ def scrape_both(
                     "--disable-dev-shm-usage",
                 ],
             )
-        except Exception as launch_exc:
-            if "Missing X server" in str(launch_exc) or "XServer" in str(launch_exc):
-                context = p.chromium.launch_persistent_context(
-                    user_data_dir=BROWSER_SESSION_DIR,
-                    headless=True,
-                    locale="en-IN",
-                    timezone_id="Asia/Kolkata",
-                    viewport={"width": 1366, "height": 900},
-                    args=[
-                        "--disable-blink-features=AutomationControlled",
-                        "--no-sandbox",
-                        "--disable-dev-shm-usage",
-                    ],
-                )
-            else:
-                raise launch_exc
+        except Exception:
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=BROWSER_SESSION_DIR,
+                headless=True,
+                locale="en-IN",
+                timezone_id="Asia/Kolkata",
+                viewport={"width": 1366, "height": 900},
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            )
         try:
             if context.pages:
                 page = context.pages[0]
@@ -800,7 +802,7 @@ def main() -> None:
         "and reads price + delivery from the first organic product page."
     )
 
-    is_cloud = bool(os.environ.get("RENDER") or os.environ.get("PORT"))
+    is_cloud = bool(sys.platform != "win32" or os.environ.get("RENDER") or os.environ.get("PORT"))
 
     with st.sidebar:
         st.header("Settings")
