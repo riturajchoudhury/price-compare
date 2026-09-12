@@ -7,10 +7,9 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Install system utilities and Xvfb (Virtual Framebuffer for headless GUI support)
+# Install system utilities
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
-    xvfb \
     && rm -rf /var/lib/apt/lists/*
 
 # Install python dependencies
@@ -26,5 +25,5 @@ COPY . .
 # Expose default port
 EXPOSE 8501
 
-# Run Streamlit inside xvfb-run virtual display server so Playwright never crashes from missing XServer
-CMD ["sh", "-c", "xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24' streamlit run app.py --server.port=${PORT:-8501} --server.address=0.0.0.0 --server.headless=true"]
+# Run Streamlit with dynamic port binding for cloud providers (Render, Railway)
+CMD ["sh", "-c", "streamlit run app.py --server.port=${PORT:-8501} --server.address=0.0.0.0 --server.headless=true"]
