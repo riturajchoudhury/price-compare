@@ -509,6 +509,14 @@ def _amazon_canonical_dp(url: str) -> str:
 
 _MATCH_STOP_WORDS = {"a", "an", "and", "for", "in", "of", "on", "the", "with"}
 _VARIANT_WORDS = {"air", "lite", "max", "mini", "plus", "pro", "ultra"}
+_ACCESSORY_WORDS = {
+    "case",
+    "charger",
+    "cover",
+    "guard",
+    "protector",
+    "skin",
+}
 
 
 def _match_tokens(text: str) -> list[str]:
@@ -544,6 +552,25 @@ def _product_match_score(keyword: str, candidate: str) -> float:
         score -= 100.0
     extra_variants = (candidate_tokens & _VARIANT_WORDS) - query_variants
     score -= 8.0 * len(extra_variants)
+
+    # Exact model names are commonly repeated in accessory listings. Do not let a
+    # case/cover/charger outrank the phone unless the user explicitly requested it.
+    query_accessories = set(query_tokens) & _ACCESSORY_WORDS
+    extra_accessories = (candidate_tokens & _ACCESSORY_WORDS) - query_accessories
+    score -= 100.0 * len(extra_accessories)
+
+    # If the user did not choose a capacity, prefer the base/lower-capacity variant
+    # consistently across stores instead of accepting whichever card appears first.
+    query_has_capacity = any(re.fullmatch(r"\d+(?:\.\d+)?(?:gb|tb)", token) for token in query_tokens)
+    if not query_has_capacity:
+        capacities_gb: list[float] = []
+        for token in candidate_tokens:
+            capacity = re.fullmatch(r"(\d+(?:\.\d+)?)(gb|tb)", token)
+            if capacity:
+                value = float(capacity.group(1))
+                capacities_gb.append(value * 1024 if capacity.group(2) == "tb" else value)
+        # A tiny tie-break penalty cannot outweigh actual model/variant matches.
+        score -= sum(capacities_gb) / 1000.0
     return score
 
 
@@ -1169,7 +1196,9 @@ def flipkart_first_organic_url(page: Page, keyword: str, timeout_ms: int) -> str
         candidate_text = str(item.get("title") or "") or card_text
         full = _absolute_url("https://www.flipkart.com", href)
         candidates.append(
-            (_product_match_score(keyword, candidate_text), full.split("?")[0])
+            # Flipkart stores the selected colour/storage variant in pid/lid query
+            # parameters. Removing the query silently redirects to its default SKU.
+            (_product_match_score(keyword, candidate_text), full)
         )
 
     if candidates:
