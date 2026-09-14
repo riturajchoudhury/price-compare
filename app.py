@@ -200,11 +200,20 @@ def _offers_from_product(product: dict) -> dict:
 
 def extract_from_jsonld(page: Page) -> dict[str, Any]:
     """Parse Product + offers from application/ld+json blocks."""
-    scripts = page.locator('script[type="application/ld+json"]')
-    count = scripts.count()
     products: list[dict] = []
-    for i in range(count):
-        raw = scripts.nth(i).inner_text(timeout=2000)
+    try:
+        # script elements are non-visible and Flipkart frequently replaces them
+        # during hydration. Snapshot textContent in one call rather than waiting on
+        # each locator with inner_text(), which can time out on a changing page.
+        raw_scripts = page.locator(
+            'script[type="application/ld+json"]'
+        ).evaluate_all("nodes => nodes.map(node => node.textContent || '')")
+    except Exception:
+        raw_scripts = []
+
+    for raw in raw_scripts:
+        if not isinstance(raw, str) or not raw.strip():
+            continue
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
