@@ -68,6 +68,10 @@ class ScrapeError(Exception):
     """Non-fatal scrape failure that should still retry (empty organic results, etc.)."""
 
 
+class ProductMatchError(Exception):
+    """Search results loaded, but none matched the requested product closely."""
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -259,6 +263,109 @@ def _normalize_price_number(raw: str | None) -> str | None:
     return f"{value:.2f}".rstrip("0").rstrip(".")
 
 
+def _format_capacity(value: str, unit: str) -> str:
+    number = value.rstrip("0").rstrip(".") if "." in value else value
+    return f"{number} {unit.upper()}"
+
+
+def _extract_memory_specs(
+    page: Page, title: str, site: str
+) -> tuple[str | None, str | None]:
+    """Extract explicitly labelled RAM and storage without inventing values."""
+    scoped_parts = [title]
+    title_selector = "#productTitle" if site == "amazon" else "h1"
+    try:
+        page_titles = page.locator(title_selector)
+        if page_titles.count() > 0:
+            scoped_parts.append(page_titles.first.inner_text(timeout=1000))
+    except Exception:
+        pass
+
+    if site == "amazon":
+        for selector in (
+            "#feature-bullets",
+            "#productDetails_techSpec_section_1",
+            "#productDetails_detailBullets_sections1",
+            "#detailBullets_feature_div",
+        ):
+            try:
+                section = page.locator(selector)
+                if section.count() > 0:
+                    scoped_parts.append(section.first.inner_text(timeout=1000))
+            except Exception:
+                pass
+    else:
+        # Flipkart's compact product highlights are part of the main product area;
+        # stop before recommendations, where other products' RAM values appear.
+        try:
+            body = page.locator("body").inner_text(timeout=2500)
+            highlight_start = body.lower().find("product highlights")
+            if highlight_start >= 0:
+                scoped_parts.append(body[highlight_start : highlight_start + 700])
+        except Exception:
+            pass
+
+    text = "\n".join(scoped_parts)
+    title_text = " ".join(scoped_parts[:2])
+
+    ram_patterns = (
+        r"\b(\d+(?:\.\d+)?)\s*(GB|TB)\s*(?:of\s+)?RAM\b",
+        r"\bRAM\s*[:\-]?\s*(\d+(?:\.\d+)?)\s*(GB|TB)\b",
+    )
+    storage_patterns = (
+        r"\b(\d+(?:\.\d+)?)\s*(GB|TB)\s*(?:internal\s+)?storage\b",
+        r"\b(?:internal\s+)?storage\s*[:\-]?\s*(\d+(?:\.\d+)?)\s*(GB|TB)\b",
+        r"\b(\d+(?:\.\d+)?)\s*(GB|TB)\s+ROM\b",
+        r"\bROM\s*[:\-]?\s*(\d+(?:\.\d+)?)\s*(GB|TB)\b",
+        r"\b(\d+(?:\.\d+)?)\s*(GB|TB)\s*(?:SSD|HDD)\b",
+    )
+
+    def first_match(patterns: tuple[str, ...]) -> str | None:
+        for pattern in patterns:
+            match = re.search(pattern, text, re.I)
+            if match:
+                return _format_capacity(match.group(1), match.group(2))
+        return None
+
+    ram = first_match(ram_patterns)
+    storage = first_match(storage_patterns)
+
+    # Many Android titles use the compact, well-established "8GB+128GB" form.
+    compact = re.search(
+        r"\b(\d+(?:\.\d+)?)\s*(GB|TB)\s*[+/]\s*"
+        r"(\d+(?:\.\d+)?)\s*(GB|TB)\b",
+        title_text,
+        re.I,
+    )
+    if compact:
+        ram = ram or _format_capacity(compact.group(1), compact.group(2))
+        storage = storage or _format_capacity(compact.group(3), compact.group(4))
+
+    # Common phone-title form: "(Color, 8GB, 128GB Storage)".
+    labelled_pair = re.search(
+        r"\b(\d+(?:\.\d+)?)\s*(GB|TB)\s*,\s*"
+        r"(\d+(?:\.\d+)?)\s*(GB|TB)\s*(?:Storage|ROM)\b",
+        title_text,
+        re.I,
+    )
+    if labelled_pair:
+        ram = ram or _format_capacity(labelled_pair.group(1), labelled_pair.group(2))
+        storage = storage or _format_capacity(
+            labelled_pair.group(3), labelled_pair.group(4)
+        )
+
+    # Apple does not advertise RAM. A single capacity in an iPhone/iPad title is
+    # storage; deliberately leave RAM unknown rather than inferring it.
+    if not storage and re.search(r"\b(?:iphone|ipad)\b", title_text, re.I):
+        capacities = re.findall(
+            r"\b(\d+(?:\.\d+)?)\s*(GB|TB)\b", title_text, re.I
+        )
+        if len(capacities) == 1:
+            storage = _format_capacity(*capacities[0])
+
+    return ram, storage
+
+
 def _price_from_offscreen_text(text: str) -> str | None:
     text = " ".join((text or "").split())
     if not text or _BAD_PRICE_CONTEXT.search(text):
@@ -376,6 +483,56 @@ def _first_rupee_text(page: Page) -> str | None:
 
 def _delivery_text(page: Page, site: str) -> str:
     if site == "amazon":
+        # Amazon's buy box has dedicated primary/secondary delivery slots. Searching
+        # the entire page also finds dates from alternate sellers and carousels.
+        delivery_roots = page.locator("#mir-layout-DELIVERY_BLOCK")
+        if delivery_roots.count() > 0:
+            messages: list[str] = []
+            # Amazon can render several responsive copies of this ID. Collect all
+            # slot nodes across them; the first copy often lacks fastest delivery.
+            slots = page.locator(
+                '#mir-layout-DELIVERY_BLOCK '
+                '[id^="mir-layout-DELIVERY_BLOCK-slot-"]'
+            )
+            targets = [slots.nth(i) for i in range(slots.count())]
+            if not targets:
+                targets = [delivery_roots.nth(i) for i in range(delivery_roots.count())]
+            for target in targets:
+                try:
+                    message = " ".join(target.inner_text(timeout=1000).split())
+                except Exception:
+                    continue
+                message = re.sub(r"\s+Details\s*$", "", message, flags=re.I)
+                duplicate_key = message.rstrip(". ").lower()
+                if message and not any(
+                    existing.rstrip(". ").lower() == duplicate_key
+                    for existing in messages
+                ):
+                    messages.append(message)
+            if messages:
+                fastest = next(
+                    (
+                        message
+                        for message in messages
+                        if re.search(r"fastest\s+delivery|order\s+within", message, re.I)
+                    ),
+                    None,
+                )
+                primary_candidates = [
+                    message for message in messages if message != fastest
+                ]
+                primary = next(
+                    (
+                        message
+                        for message in primary_candidates
+                        if re.match(r"(?:Or\s+)?FREE\s+delivery", message, re.I)
+                    ),
+                    primary_candidates[0] if primary_candidates else None,
+                )
+                selected = [message for message in (primary, fastest) if message]
+                if selected:
+                    return " | ".join(selected)
+
         needles = (
             "Get it by",
             "Deliver to",
@@ -405,7 +562,28 @@ def _delivery_text(page: Page, site: str) -> str:
             n = 0
         for i in range(n):
             try:
-                t = loc.nth(i).inner_text(timeout=1000).strip()
+                node = loc.nth(i)
+                if site == "flipkart":
+                    # Flipkart renders "Delivery by" and its date in sibling
+                    # elements. Walk upward to the smallest ancestor containing
+                    # both instead of returning only the label.
+                    t = node.evaluate(
+                        """(el) => {
+                            const own = (el.innerText || '').trim();
+                            let node = el;
+                            for (let i = 0; i < 5 && node.parentElement; i++) {
+                                const parent = node.parentElement;
+                                const text = (parent.innerText || '').trim();
+                                if (text.length > own.length && text.length <= 300) {
+                                    return text;
+                                }
+                                node = parent;
+                            }
+                            return own;
+                        }"""
+                    )
+                else:
+                    t = node.inner_text(timeout=1000).strip()
             except Exception:
                 continue
             # Keep a short readable line
@@ -508,7 +686,9 @@ def amazon_first_organic_url(page: Page, keyword: str, timeout_ms: int) -> str:
         best_score, best_url = max(candidates, key=lambda item: item[0])
         if best_score >= 0:
             return best_url
-        raise ScrapeError("Amazon.in: no result closely matched the requested product")
+        raise ProductMatchError(
+            "Amazon.in: no result closely matched the requested product"
+        )
 
     raise ScrapeError("Amazon.in: no organic (non-sponsored) product found")
 
@@ -528,53 +708,41 @@ def flipkart_first_organic_url(page: Page, keyword: str, timeout_ms: int) -> str
         _raise_if_blocked(page, "Flipkart")
         raise CaptchaOrBlockError("Flipkart: search results did not load (page delayed or bot-blocked)") from exc
 
+    # Read candidate metadata in one browser call. Calling Playwright separately
+    # for every attribute/text field is especially slow on blocked or degraded pages.
+    raw_candidates = links.evaluate_all(
+        """(nodes) => nodes.slice(0, 40).map((a) => {
+            let card = a;
+            for (let i = 0; i < 5 && card.parentElement; i++) {
+                card = card.parentElement;
+            }
+            const img = a.querySelector('img[alt]');
+            return {
+                href: a.getAttribute('href') || '',
+                title: [
+                    a.getAttribute('title') || '',
+                    a.getAttribute('aria-label') || '',
+                    a.innerText || '',
+                    img ? (img.getAttribute('alt') || '') : ''
+                ].filter(Boolean).join(' '),
+                cardText: card ? (card.innerText || '') : (a.innerText || '')
+            };
+        })"""
+    )
+
     candidates: list[tuple[float, str]] = []
-    count = min(links.count(), 40)
-    for i in range(count):
-        a = links.nth(i)
-        href = a.get_attribute("href") or ""
+    for item in raw_candidates:
+        href = str(item.get("href") or "")
         if "/p/" not in href or "/search?" in href:
             continue
-        # Skip sponsored "Ad" cards: check nearby card text for a standalone Ad marker
-        try:
-            # Climb a few ancestors for card text without relying on Flipkart class names
-            card_text = a.evaluate(
-                """(el) => {
-                    let n = el;
-                    for (let i = 0; i < 6 && n; i++) {
-                        n = n.parentElement;
-                    }
-                    return n ? (n.innerText || '') : (el.innerText || '');
-                }"""
-            )
-        except Exception:
-            card_text = ""
+        card_text = str(item.get("cardText") or "")
         # Flipkart sponsored rows typically show a lone "Ad" badge
         if re.search(r"(^|\n)\s*Ad\s*(\n|$)", card_text) or re.search(
             r"\bSponsored\b", card_text, re.I
         ):
             continue
 
-        title_parts: list[str] = []
-        for value in (a.get_attribute("title"), a.get_attribute("aria-label")):
-            if value:
-                title_parts.append(value)
-        try:
-            anchor_text = a.inner_text(timeout=1000).strip()
-            if anchor_text:
-                title_parts.append(anchor_text)
-        except Exception:
-            pass
-        try:
-            images = a.locator("img[alt]")
-            if images.count() > 0:
-                alt = images.first.get_attribute("alt", timeout=500)
-                if alt:
-                    title_parts.append(alt)
-        except Exception:
-            pass
-
-        candidate_text = " ".join(title_parts) or card_text
+        candidate_text = str(item.get("title") or "") or card_text
         full = _absolute_url("https://www.flipkart.com", href)
         candidates.append(
             (_product_match_score(keyword, candidate_text), full.split("?")[0])
@@ -584,7 +752,9 @@ def flipkart_first_organic_url(page: Page, keyword: str, timeout_ms: int) -> str
         best_score, best_url = max(candidates, key=lambda item: item[0])
         if best_score >= 0:
             return best_url
-        raise ScrapeError("Flipkart: no result closely matched the requested product")
+        raise ProductMatchError(
+            "Flipkart: no result closely matched the requested product"
+        )
 
     raise ScrapeError("Flipkart: no organic (non-ad) product found")
 
@@ -627,6 +797,7 @@ def scrape_product_page(page: Page, url: str, site: str, timeout_ms: int) -> dic
 
     delivery = _delivery_text(page, "amazon" if site == "amazon" else "flipkart")
     available = _infer_available(delivery, jsonld)
+    ram, storage = _extract_memory_specs(page, title, site)
     image_url = jsonld.get("image")
     if isinstance(image_url, list) and image_url:
         # Take the first image URL if it is a list
@@ -656,6 +827,8 @@ def scrape_product_page(page: Page, url: str, site: str, timeout_ms: int) -> dic
         "currency": currency,
         "delivery": delivery,
         "available": available,
+        "ram": ram,
+        "storage": storage,
         "error": None,
         "image": image_url,
     }
@@ -750,6 +923,8 @@ def empty_result(site_label: str, error: str) -> dict[str, Any]:
         "currency": None,
         "delivery": None,
         "available": None,
+        "ram": None,
+        "storage": None,
         "error": error,
     }
 
@@ -761,9 +936,9 @@ def empty_result(site_label: str, error: str) -> dict[str, Any]:
     reraise=True,
     stop=stop_after_attempt(2),
     wait=wait_exponential(multiplier=1, min=1, max=3),
-    retry=retry_if_exception_type(
-        (CaptchaOrBlockError, ScrapeError, PlaywrightTimeoutError)
-    ),
+    # A confirmed captcha/block will not clear by immediately repeating the same
+    # request from the same IP. Let it fail fast with a useful message instead.
+    retry=retry_if_exception_type((ScrapeError, PlaywrightTimeoutError)),
 )
 def scrape_site(page: Page, site: str, keyword: str, timeout_ms: int) -> dict[str, Any]:
     """Search one store, open first organic product, extract price + delivery."""
@@ -865,6 +1040,11 @@ def render_result(col, data: dict[str, Any]) -> None:
             return
         if data.get("title"):
             st.markdown(f"**{data['title']}**")
+        spec_left, spec_right = st.columns(2)
+        spec_left.caption("RAM")
+        spec_left.markdown(f"**{data.get('ram') or 'Not specified'}**")
+        spec_right.caption("STORAGE")
+        spec_right.markdown(f"**{data.get('storage') or 'Not specified'}**")
         if data.get("url"):
             st.markdown(f"[Open product]({data['url']})")
         # Display product image if available
