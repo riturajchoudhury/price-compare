@@ -767,6 +767,23 @@ def _extract_memory_specs(
             labelled_pair.group(3), labelled_pair.group(4)
         )
 
+    # Amazon also uses phone titles such as "(8GB 128GB Black)" without labels
+    # or punctuation. In this established two-capacity form the first value is RAM
+    # and the second is internal storage.
+    unlabelled_pair = re.search(
+        r"[\[(]\s*(\d+(?:\.\d+)?)\s*(GB|TB)\s+"
+        r"(\d+(?:\.\d+)?)\s*(GB|TB)\b",
+        title_text,
+        re.I,
+    )
+    if unlabelled_pair:
+        ram = ram or _format_capacity(
+            unlabelled_pair.group(1), unlabelled_pair.group(2)
+        )
+        storage = storage or _format_capacity(
+            unlabelled_pair.group(3), unlabelled_pair.group(4)
+        )
+
     # Apple does not advertise RAM. A single capacity in an iPhone/iPad title is
     # storage; deliberately leave RAM unknown rather than inferring it.
     if not storage and re.search(r"\b(?:iphone|ipad)\b", title_text, re.I):
