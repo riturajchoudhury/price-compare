@@ -663,40 +663,33 @@ def amazon_first_organic_url(page: Page, keyword: str, timeout_ms: int) -> str:
         _raise_if_blocked(page, "Amazon.in")
         raise CaptchaOrBlockError("Amazon.in: search results did not load (page delayed or bot-blocked)") from exc
 
+    raw_candidates = cards.evaluate_all(
+        """(nodes) => nodes.slice(0, 40).map((card) => {
+            const links = [...card.querySelectorAll('a[href*="/dp/"]')];
+            const link = links.find((a) => a.closest('h2')) || links[0] || null;
+            const heading = card.querySelector('h2[aria-label]');
+            return {
+                asin: (card.getAttribute('data-asin') || '').trim(),
+                href: link ? (link.getAttribute('href') || '') : '',
+                title: heading ? (heading.getAttribute('aria-label') || '') : '',
+                text: card.innerText || ''
+            };
+        })"""
+    )
+
     candidates: list[tuple[float, str]] = []
-    count = cards.count()
-    for i in range(count):
-        card = cards.nth(i)
-        asin = (card.get_attribute("data-asin") or "").strip()
+    for item in raw_candidates:
+        asin = str(item.get("asin") or "").strip()
         if not asin:
             continue
-        try:
-            text = card.inner_text(timeout=2000)
-        except Exception:
-            text = ""
+        text = str(item.get("text") or "")
         if re.search(r"\bsponsored\b", text, re.I):
             continue
 
-        href = None
-        title = ""
-        for sel in ('h2 a[href]', 'a.a-link-normal[href*="/dp/"]'):
-            link = card.locator(sel)
-            if link.count() == 0:
-                continue
-            href = link.first.get_attribute("href")
-            if href and "/dp/" in href:
-                try:
-                    title = link.first.inner_text(timeout=1000).strip()
-                except Exception:
-                    title = ""
-                break
-            href = None
-
-        if not href:
+        href = str(item.get("href") or "")
+        if "/dp/" not in href:
             continue
-        heading = card.locator("h2[aria-label]")
-        if heading.count() > 0:
-            title = heading.first.get_attribute("aria-label", timeout=500) or title
+        title = str(item.get("title") or "")
         candidates.append(
             (
                 _product_match_score(keyword, title or text),
