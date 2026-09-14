@@ -94,6 +94,21 @@ def _absolute_url(base: str, href: str) -> str:
     return urljoin(base, href)
 
 
+def _navigate(page: Page, url: str, timeout_ms: int) -> None:
+    """Navigate without depending on Amazon/Flipkart finishing every page script."""
+    page.goto(url, wait_until="commit", timeout=timeout_ms)
+    try:
+        page.wait_for_load_state(
+            "domcontentloaded", timeout=min(timeout_ms, 8000)
+        )
+    except PlaywrightTimeoutError:
+        # On cloud IPs Amazon can keep a script/redirect pending even though the
+        # response body and product DOM are already usable.
+        body = page.locator("body")
+        if body.count() == 0:
+            raise
+
+
 def _amazon_canonical_dp(url: str) -> str:
     """Keep a clean /dp/ASIN product URL when possible."""
     m = re.search(r"(/dp/[A-Z0-9]{10})", url, re.I)
@@ -630,7 +645,7 @@ def dismiss_flipkart_login(page: Page) -> None:
 def amazon_first_organic_url(page: Page, keyword: str, timeout_ms: int) -> str:
     q = quote_plus(keyword)
     url = AMAZON_SEARCH.format(q=q)
-    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+    _navigate(page, url, timeout_ms)
     page.wait_for_timeout(1500)
     _raise_if_blocked(page, "Amazon.in")
 
@@ -696,7 +711,7 @@ def amazon_first_organic_url(page: Page, keyword: str, timeout_ms: int) -> str:
 def flipkart_first_organic_url(page: Page, keyword: str, timeout_ms: int) -> str:
     q = quote_plus(keyword)
     url = FLIPKART_SEARCH.format(q=q)
-    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+    _navigate(page, url, timeout_ms)
     page.wait_for_timeout(1500)
     dismiss_flipkart_login(page)
     _raise_if_blocked(page, "Flipkart")
@@ -760,11 +775,20 @@ def flipkart_first_organic_url(page: Page, keyword: str, timeout_ms: int) -> str
 
 
 def scrape_product_page(page: Page, url: str, site: str, timeout_ms: int) -> dict[str, Any]:
-    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+    _navigate(page, url, timeout_ms)
     page.wait_for_timeout(1200)
     if site == "flipkart":
         dismiss_flipkart_login(page)
     _raise_if_blocked(page, site)
+
+    ready_selector = "#productTitle" if site == "amazon" else "h1"
+    try:
+        page.locator(ready_selector).first.wait_for(
+            state="attached", timeout=min(timeout_ms, 6000)
+        )
+    except PlaywrightTimeoutError:
+        # JSON-LD may still provide a usable product result.
+        pass
 
     jsonld = extract_from_jsonld(page)
     title = jsonld.get("title") or ""
@@ -789,11 +813,8 @@ def scrape_product_page(page: Page, url: str, site: str, timeout_ms: int) -> dic
             if rupee:
                 price = _normalize_price_number(rupee)
 
-    if not price and site == "amazon":
-        # Last resort only after buybox + JSON-LD
-        rupee = _first_rupee_text(page)
-        if rupee:
-            price = _normalize_price_number(rupee)
+    # Do not scan arbitrary Amazon body text for a price. Coupons, exchange
+    # values, accessories and alternate sellers can all appear before the buybox.
 
     delivery = _delivery_text(page, "amazon" if site == "amazon" else "flipkart")
     available = _infer_available(delivery, jsonld)
