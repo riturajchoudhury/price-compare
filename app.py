@@ -96,10 +96,17 @@ def _absolute_url(base: str, href: str) -> str:
 
 def _navigate(page: Page, url: str, timeout_ms: int) -> None:
     """Navigate without depending on Amazon/Flipkart finishing every page script."""
-    page.goto(url, wait_until="commit", timeout=timeout_ms)
+    is_cloud = bool(
+        sys.platform != "win32" or os.environ.get("RENDER") or os.environ.get("PORT")
+    )
+    # A retailer silently dropping traffic from a datacenter IP will never improve
+    # by occupying the only Streamlit request for a full minute. Fail that store
+    # promptly so the other result can still be returned.
+    navigation_timeout = min(timeout_ms, 12000) if is_cloud else timeout_ms
+    page.goto(url, wait_until="commit", timeout=navigation_timeout)
     try:
         page.wait_for_load_state(
-            "domcontentloaded", timeout=min(timeout_ms, 8000)
+            "domcontentloaded", timeout=min(navigation_timeout, 8000)
         )
     except PlaywrightTimeoutError:
         # On cloud IPs Amazon can keep a script/redirect pending even though the
@@ -959,7 +966,7 @@ def empty_result(site_label: str, error: str) -> dict[str, Any]:
     wait=wait_exponential(multiplier=1, min=1, max=3),
     # A confirmed captcha/block will not clear by immediately repeating the same
     # request from the same IP. Let it fail fast with a useful message instead.
-    retry=retry_if_exception_type((ScrapeError, PlaywrightTimeoutError)),
+    retry=retry_if_exception_type(ScrapeError),
 )
 def scrape_site(page: Page, site: str, keyword: str, timeout_ms: int) -> dict[str, Any]:
     """Search one store, open first organic product, extract price + delivery."""
