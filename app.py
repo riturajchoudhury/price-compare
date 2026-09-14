@@ -89,6 +89,51 @@ def _raise_if_blocked(page: Page, site: str) -> None:
         raise CaptchaOrBlockError(f"{site}: captcha or block detected at {page.url}")
 
 
+def _recover_amazon_continue_interstitial(
+    page: Page, timeout_ms: int, expected_url: str
+) -> None:
+    """Clear Amazon's button-only 'Continue shopping' checkpoint once."""
+    if page.locator("#productTitle").count() > 0:
+        return
+    try:
+        body_text = page.locator("body").inner_text(timeout=1500)
+    except Exception:
+        return
+    if "continue shopping" not in body_text.lower():
+        return
+
+    controls = page.locator(
+        'button:has-text("Continue shopping"), '
+        'input[type="submit"][value*="Continue shopping"], '
+        'a:has-text("Continue shopping")'
+    )
+    if controls.count() > 0:
+        try:
+            controls.first.click(timeout=3000)
+        except Exception:
+            pass
+    else:
+        # Some variants submit the checkpoint automatically after its script runs.
+        page.wait_for_timeout(1200)
+
+    ready = page.locator(
+        '#productTitle, div[data-component-type="s-search-result"][data-asin]'
+    )
+    page.wait_for_timeout(500)
+    if ready.count() == 0 and expected_url:
+        # The checkpoint commonly redirects to Amazon's homepage. Its cookie is now
+        # cleared, so revisit the one URL the user originally requested.
+        _navigate(page, expected_url, timeout_ms)
+
+    try:
+        ready.first.wait_for(
+            state="attached", timeout=min(timeout_ms, 6000)
+        )
+    except PlaywrightTimeoutError:
+        # Leave genuine/uncleared blocks to the normal detector and error message.
+        pass
+
+
 def _absolute_url(base: str, href: str) -> str:
     return urljoin(base, href)
 
@@ -665,6 +710,7 @@ def amazon_first_organic_url(page: Page, keyword: str, timeout_ms: int) -> str:
     url = AMAZON_SEARCH.format(q=q)
     _navigate(page, url, timeout_ms)
     page.wait_for_timeout(1500)
+    _recover_amazon_continue_interstitial(page, timeout_ms, url)
     _raise_if_blocked(page, "Amazon.in")
 
     cards = page.locator('div[data-component-type="s-search-result"][data-asin]')
@@ -790,6 +836,8 @@ def scrape_product_page(page: Page, url: str, site: str, timeout_ms: int) -> dic
     page.wait_for_timeout(1200)
     if site == "flipkart":
         dismiss_flipkart_login(page)
+    else:
+        _recover_amazon_continue_interstitial(page, timeout_ms, url)
     _raise_if_blocked(page, site)
 
     ready_selector = "#productTitle" if site == "amazon" else "h1"
