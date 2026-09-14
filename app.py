@@ -95,24 +95,18 @@ def _absolute_url(base: str, href: str) -> str:
 
 def _navigate(page: Page, url: str, timeout_ms: int) -> None:
     """Navigate without depending on Amazon/Flipkart finishing every page script."""
-    is_cloud = bool(
-        sys.platform != "win32" or os.environ.get("RENDER") or os.environ.get("PORT")
-    )
-    # A retailer silently dropping traffic from a datacenter IP will never improve
-    # by occupying the only Streamlit request for a full minute. Fail that store
-    # promptly so the other result can still be returned.
-    navigation_timeout = min(timeout_ms, 12000) if is_cloud else timeout_ms
-    page.goto(url, wait_until="commit", timeout=navigation_timeout)
+    # Honor the timeout selected in the UI. Amazon can take 30–60 seconds to send
+    # its first response to Render even when the request ultimately succeeds.
+    page.goto(url, wait_until="commit", timeout=timeout_ms)
     try:
         page.wait_for_load_state(
-            "domcontentloaded", timeout=min(navigation_timeout, 8000)
+            "domcontentloaded", timeout=min(timeout_ms, 8000)
         )
     except PlaywrightTimeoutError:
         # On cloud IPs Amazon can keep a script/redirect pending even though the
-        # response body and product DOM are already usable.
-        body = page.locator("body")
-        if body.count() == 0:
-            raise
+        # response body and product DOM are already usable. Later site-specific
+        # locators decide whether enough content actually arrived.
+        pass
 
 
 def _result_wait_timeout(timeout_ms: int) -> int:
@@ -166,6 +160,8 @@ def _product_match_score(keyword: str, candidate: str) -> float:
         score -= 100.0
 
     query_variants = set(query_tokens) & _VARIANT_WORDS
+    if not query_variants.issubset(candidate_tokens):
+        score -= 100.0
     extra_variants = (candidate_tokens & _VARIANT_WORDS) - query_variants
     score -= 8.0 * len(extra_variants)
     return score
@@ -1116,7 +1112,7 @@ def main() -> None:
         else:
             headed = st.checkbox("Headed (warm-up)", value=False)
 
-        timeout_s = st.slider("Page timeout (seconds)", 10, 60, 25)
+        timeout_s = st.slider("Page timeout (seconds)", 10, 90, 60)
 
         if not is_cloud:
             st.markdown(
