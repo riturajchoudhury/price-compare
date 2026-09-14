@@ -101,6 +101,44 @@ def _amazon_canonical_dp(url: str) -> str:
     return url.split("?")[0]
 
 
+_MATCH_STOP_WORDS = {"a", "an", "and", "for", "in", "of", "on", "the", "with"}
+_VARIANT_WORDS = {"air", "lite", "max", "mini", "plus", "pro", "ultra"}
+
+
+def _match_tokens(text: str) -> list[str]:
+    """Normalize product text while preserving model numbers and capacities."""
+    normalized = re.sub(r"(?<=\d)\s+(?=(?:gb|tb)\b)", "", text.lower())
+    return [
+        token
+        for token in re.findall(r"\d+(?:\.\d+)?[a-z]+|\d+(?:\.\d+)?|[a-z]+", normalized)
+        if token not in _MATCH_STOP_WORDS
+    ]
+
+
+def _product_match_score(keyword: str, candidate: str) -> float:
+    """Score a search card against the query and penalize conflicting variants."""
+    query_tokens = _match_tokens(keyword)
+    candidate_tokens = set(_match_tokens(candidate))
+    if not query_tokens or not candidate_tokens:
+        return -1000.0
+
+    score = 0.0
+    for token in query_tokens:
+        if token in candidate_tokens:
+            score += 6.0 if any(ch.isdigit() for ch in token) else 2.0
+        else:
+            score -= 10.0 if any(ch.isdigit() for ch in token) else 2.5
+
+    query_numbers = {t for t in query_tokens if any(ch.isdigit() for ch in t)}
+    if not query_numbers.issubset(candidate_tokens):
+        score -= 100.0
+
+    query_variants = set(query_tokens) & _VARIANT_WORDS
+    extra_variants = (candidate_tokens & _VARIANT_WORDS) - query_variants
+    score -= 8.0 * len(extra_variants)
+    return score
+
+
 def _walk_jsonld(node: Any) -> list[dict]:
     found: list[dict] = []
     if isinstance(node, dict):
@@ -425,6 +463,7 @@ def amazon_first_organic_url(page: Page, keyword: str, timeout_ms: int) -> str:
         _raise_if_blocked(page, "Amazon.in")
         raise CaptchaOrBlockError("Amazon.in: search results did not load (page delayed or bot-blocked)") from exc
 
+    candidates: list[tuple[float, str]] = []
     count = cards.count()
     for i in range(count):
         card = cards.nth(i)
@@ -439,18 +478,37 @@ def amazon_first_organic_url(page: Page, keyword: str, timeout_ms: int) -> str:
             continue
 
         href = None
+        title = ""
         for sel in ('h2 a[href]', 'a.a-link-normal[href*="/dp/"]'):
             link = card.locator(sel)
             if link.count() == 0:
                 continue
             href = link.first.get_attribute("href")
             if href and "/dp/" in href:
+                try:
+                    title = link.first.inner_text(timeout=1000).strip()
+                except Exception:
+                    title = ""
                 break
             href = None
 
         if not href:
             continue
-        return _amazon_canonical_dp(_absolute_url("https://www.amazon.in", href))
+        heading = card.locator("h2[aria-label]")
+        if heading.count() > 0:
+            title = heading.first.get_attribute("aria-label", timeout=500) or title
+        candidates.append(
+            (
+                _product_match_score(keyword, title or text),
+                _amazon_canonical_dp(_absolute_url("https://www.amazon.in", href)),
+            )
+        )
+
+    if candidates:
+        best_score, best_url = max(candidates, key=lambda item: item[0])
+        if best_score >= 0:
+            return best_url
+        raise ScrapeError("Amazon.in: no result closely matched the requested product")
 
     raise ScrapeError("Amazon.in: no organic (non-sponsored) product found")
 
@@ -470,6 +528,7 @@ def flipkart_first_organic_url(page: Page, keyword: str, timeout_ms: int) -> str
         _raise_if_blocked(page, "Flipkart")
         raise CaptchaOrBlockError("Flipkart: search results did not load (page delayed or bot-blocked)") from exc
 
+    candidates: list[tuple[float, str]] = []
     count = min(links.count(), 40)
     for i in range(count):
         a = links.nth(i)
@@ -496,9 +555,36 @@ def flipkart_first_organic_url(page: Page, keyword: str, timeout_ms: int) -> str
         ):
             continue
 
+        title_parts: list[str] = []
+        for value in (a.get_attribute("title"), a.get_attribute("aria-label")):
+            if value:
+                title_parts.append(value)
+        try:
+            anchor_text = a.inner_text(timeout=1000).strip()
+            if anchor_text:
+                title_parts.append(anchor_text)
+        except Exception:
+            pass
+        try:
+            images = a.locator("img[alt]")
+            if images.count() > 0:
+                alt = images.first.get_attribute("alt", timeout=500)
+                if alt:
+                    title_parts.append(alt)
+        except Exception:
+            pass
+
+        candidate_text = " ".join(title_parts) or card_text
         full = _absolute_url("https://www.flipkart.com", href)
-        # Drop tracking query noise but keep path
-        return full.split("?")[0]
+        candidates.append(
+            (_product_match_score(keyword, candidate_text), full.split("?")[0])
+        )
+
+    if candidates:
+        best_score, best_url = max(candidates, key=lambda item: item[0])
+        if best_score >= 0:
+            return best_url
+        raise ScrapeError("Flipkart: no result closely matched the requested product")
 
     raise ScrapeError("Flipkart: no organic (non-ad) product found")
 
@@ -737,7 +823,8 @@ def scrape_both(
 
             stealth_sync(page)
 
-            # Block heavy resources to reduce RAM, bandwidth, and load times
+            # Product image URLs remain available in DOM/JSON-LD without downloading
+            # the image bytes, which keeps Chromium's memory and load time bounded.
             def route_interceptor(route: Any) -> None:
                 if route.request.resource_type in {"image", "media", "font"}:
                     route.abort()
