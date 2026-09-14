@@ -2,7 +2,7 @@
 
 Streamlit app that searches **Amazon.in** and **Flipkart** from a product keyword, skips sponsored ads, opens the first organic product page, and shows live price + deliverability.
 
-Uses **sync Playwright**, a **persistent browser profile** (`./browser_session`), **playwright-stealth**, and **tenacity** retries.
+Uses **sync Playwright**, a **persistent browser profile** (`./browser_session`), and **playwright-stealth**.
 
 ## Install
 

@@ -14,7 +14,6 @@ from urllib.parse import quote_plus, urljoin, urlparse
 import streamlit as st
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 # ---------------------------------------------------------------------------
 # playwright-stealth compatibility (v1 stealth_sync vs v2 Stealth API)
@@ -114,6 +113,13 @@ def _navigate(page: Page, url: str, timeout_ms: int) -> None:
         body = page.locator("body")
         if body.count() == 0:
             raise
+
+
+def _result_wait_timeout(timeout_ms: int) -> int:
+    is_cloud = bool(
+        sys.platform != "win32" or os.environ.get("RENDER") or os.environ.get("PORT")
+    )
+    return min(timeout_ms, 6000 if is_cloud else 12000)
 
 
 def _amazon_canonical_dp(url: str) -> str:
@@ -658,7 +664,7 @@ def amazon_first_organic_url(page: Page, keyword: str, timeout_ms: int) -> str:
 
     cards = page.locator('div[data-component-type="s-search-result"][data-asin]')
     try:
-        cards.first.wait_for(state="attached", timeout=min(timeout_ms, 12000))
+        cards.first.wait_for(state="attached", timeout=_result_wait_timeout(timeout_ms))
     except PlaywrightTimeoutError as exc:
         _raise_if_blocked(page, "Amazon.in")
         raise CaptchaOrBlockError("Amazon.in: search results did not load (page delayed or bot-blocked)") from exc
@@ -718,7 +724,7 @@ def flipkart_first_organic_url(page: Page, keyword: str, timeout_ms: int) -> str
 
     links = page.locator('a[href*="/p/"]')
     try:
-        links.first.wait_for(state="attached", timeout=min(timeout_ms, 12000))
+        links.first.wait_for(state="attached", timeout=_result_wait_timeout(timeout_ms))
     except PlaywrightTimeoutError as exc:
         _raise_if_blocked(page, "Flipkart")
         raise CaptchaOrBlockError("Flipkart: search results did not load (page delayed or bot-blocked)") from exc
@@ -953,14 +959,6 @@ def empty_result(site_label: str, error: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Main scrape (tenacity retry)
 # ---------------------------------------------------------------------------
-@retry(
-    reraise=True,
-    stop=stop_after_attempt(2),
-    wait=wait_exponential(multiplier=1, min=1, max=3),
-    # A confirmed captcha/block will not clear by immediately repeating the same
-    # request from the same IP. Let it fail fast with a useful message instead.
-    retry=retry_if_exception_type(ScrapeError),
-)
 def scrape_site(page: Page, site: str, keyword: str, timeout_ms: int) -> dict[str, Any]:
     """Search one store, open first organic product, extract price + delivery."""
     if site == "amazon":
